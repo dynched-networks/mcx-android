@@ -54,16 +54,25 @@ jobs:
           # Newest first, by the time each release was published - the order
           # the releases page shows. Tag names alone would be wrong the day a
           # fix is published after a larger version.
-          gh release list --limit 1000 \
+          # -R is not optional here: this job never checks anything out, and
+          # without it gh tries to infer the repository from a local git remote
+          # and stops with "fatal: not a git repository".
+          gh release list -R "$GITHUB_REPOSITORY" --limit 1000 \
             --json tagName,createdAt \
             --jq 'sort_by(.createdAt) | reverse | .[].tagName' > "$work/releases.txt"
 
           mapfile -t published < "$work/releases.txt"
           if [ "${#published[@]}" -gt 0 ]; then
             printf '%s\n' "${published[@]:0:$keep}" > "$work/keep.txt"
-            printf '%s\n' "${published[@]:$keep}" > "$work/old-releases.txt"
           else
             : > "$work/keep.txt"
+          fi
+          # Slicing past the end yields no words, and printf with a format but
+          # no arguments still prints a line - so a short list would otherwise
+          # leave one empty "release" to count and iterate over.
+          if [ "${#published[@]}" -gt "$keep" ]; then
+            printf '%s\n' "${published[@]:$keep}" > "$work/old-releases.txt"
+          else
             : > "$work/old-releases.txt"
           fi
 
@@ -112,7 +121,7 @@ jobs:
           while IFS= read -r tag; do
             [ -n "$tag" ] || continue
             echo "Deleting release $tag"
-            gh release delete "$tag" --yes --cleanup-tag
+            gh release delete "$tag" -R "$GITHUB_REPOSITORY" --yes --cleanup-tag
           done < "$work/old-releases.txt"
 
       - name: Delete leftover tags
@@ -143,7 +152,7 @@ jobs:
         run: |
           set -euo pipefail
           echo "Releases left:"
-          gh release list --limit 20
+          gh release list -R "$GITHUB_REPOSITORY" --limit 20
           echo "Tags left:"
           git ls-remote --tags "https://github.com/$GITHUB_REPOSITORY" \
             | sed 's#.*refs/tags/#  #' || true
