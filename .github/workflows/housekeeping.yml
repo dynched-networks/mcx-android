@@ -51,24 +51,28 @@ jobs:
           rm -rf "$work"
           mkdir -p "$work"
 
-          # Newest first, by the time each release was published - the order
-          # the releases page shows. Tag names alone would be wrong the day a
-          # fix is published after a larger version.
+          # One line per release: publish time, a tab, the tag name. Tag names
+          # alone would be wrong the day a fix is published after a larger
+          # version.
           #
           # publishedAt, not createdAt. Every release the mirror creates can
           # share one creation time (on dynched-networks/mcx-android they are
           # all 2026-11-13T19:22:44Z) while their publish times are days apart,
-          # so sorting by createdAt left the list in gh's own newest-first
-          # order; the reverse below then made it oldest-first and the job kept
-          # the three OLDEST, deleting everything published after v0.5.15. The
-          # tag name breaks any remaining tie so the order is never gh's.
+          # so creation time cannot tell the newest release from the oldest.
+          # The tag name breaks ties, so the order is total and reproducible.
           # -R is not optional here: this job never checks anything out, and
           # without it gh tries to infer the repository from a local git remote
           # and stops with "fatal: not a git repository".
           gh release list -R "$GITHUB_REPOSITORY" --limit 1000 \
             --json tagName,publishedAt,createdAt \
-            --jq 'sort_by([(.publishedAt // .createdAt // ""), .tagName])
-                  | reverse | .[].tagName' > "$work/releases.txt"
+            --jq '.[] | [(.publishedAt // .createdAt // ""), .tagName] | @tsv' \
+            > "$work/order.tsv"
+
+          # Newest first, the order the releases page shows: sort ascending on
+          # publish time and then tag name, and turn that around. ISO-8601 UTC
+          # timestamps compare correctly as text in the C locale.
+          LC_ALL=C sort -t $'\t' -k1,1 -k2,2 "$work/order.tsv" | tac \
+            | cut -f2 > "$work/releases.txt"
 
           mapfile -t published < "$work/releases.txt"
           if [ "${#published[@]}" -gt 0 ]; then
@@ -83,6 +87,38 @@ jobs:
             printf '%s\n' "${published[@]:$keep}" > "$work/old-releases.txt"
           else
             : > "$work/old-releases.txt"
+          fi
+
+          # Safety check, before a single release is deleted: prove the ones
+          # being kept are all newer than the ones being deleted. Trusting the
+          # sort alone is what pruned the mirror backwards once - it kept the
+          # three OLDEST and deleted every release published after them - so
+          # the split is now checked instead of assumed. The oldest kept
+          # publish time must be strictly later than the newest deleted one; a
+          # kept and a deleted release sharing a timestamp cannot be proved
+          # either way, and the run stops rather than guess.
+          if [ -s "$work/old-releases.txt" ]; then
+            keep_key="$(LC_ALL=C awk -F'\t' '
+              NR == FNR { keep[$1] = 1; next }
+              $2 in keep { if (min == "" || $1 < min) min = $1 }
+              END { print min }
+            ' "$work/keep.txt" "$work/order.tsv")"
+            delete_key="$(LC_ALL=C awk -F'\t' '
+              NR == FNR { old[$1] = 1; next }
+              $2 in old { if (max == "" || $1 > max) max = $1 }
+              END { print max }
+            ' "$work/old-releases.txt" "$work/order.tsv")"
+
+            if [ -z "$keep_key" ] || [ -z "$delete_key" ]; then
+              echo "::error::Cannot compare the kept and deleted releases: a tag is missing from the release list. Nothing was deleted."
+              exit 1
+            fi
+            if ! LC_ALL=C awk -v kept="$keep_key" -v deleted="$delete_key" \
+                 'BEGIN { exit !(deleted < kept) }'; then
+              echo "::error::Refusing to prune: the newest release it would delete ($delete_key) is not older than the oldest release it would keep ($keep_key). The release order cannot be trusted, so nothing was deleted. Check the releases page before running this again."
+              exit 1
+            fi
+            echo "Ordering check passed: newest deleted $delete_key is older than oldest kept $keep_key."
           fi
 
           # Every tag, so one whose release was deleted by hand does not
@@ -107,6 +143,12 @@ jobs:
               sed 's/^/- /' "$work/keep.txt"
             else
               echo "- nothing yet"
+            fi
+            echo
+            if [ -n "${delete_key:-}" ]; then
+              echo "Ordering check: newest deleted $delete_key is older than oldest kept $keep_key."
+            else
+              echo "Ordering check: nothing to delete."
             fi
             echo
             echo "Deleting $(wc -l < "$work/old-releases.txt" | tr -d ' ') old releases and $(wc -l < "$work/old-tags.txt" | tr -d ' ') old tags."
